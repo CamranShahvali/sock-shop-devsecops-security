@@ -1,0 +1,671 @@
+name: DevSecOps Gated Pipeline
+
+# Trigger model:
+# - Branch pushes and pull requests run build, security, container, and DAST stages.
+# - Protected deploy job runs from the repository default branch only.
+# - Manual deploy validation is available via workflow_dispatch input on non-default branches.
+
+on:
+  push:
+    branches:
+      - "**"
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  pull_request:
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      run_deploy_validation:
+        description: "Run deploy validation job on current non-default branch"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  IMAGE_NAME: juice-shop
+  IMAGE_TAG: ci-${{ github.run_id }}
+
+jobs:
+  build_test:
+    name: build_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-${{ hashFiles('package.json', 'frontend/package.json', '.npmrc') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-
+
+      - name: Ensure clean dependency state
+        run: rm -rf node_modules frontend/node_modules
+
+      - name: Install dependencies
+        run: npm install --prefer-offline --no-audit --progress=false
+
+      - name: Rebuild libxmljs2 native bindings
+        run: npm rebuild libxmljs2 --build-from-source
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build server
+        run: npm run build:server
+
+      - name: Build frontend
+        run: npm run build:frontend
+
+      - name: Run server tests
+        run: npm run test:server
+
+      - name: Run API tests
+        run: npm run test:api
+
+      - name: Smoke test application startup
+        run: |
+          mkdir -p build/reports
+          npm start > build/reports/build-test-app.log 2>&1 &
+          ./scripts/wait-for-http.sh http://127.0.0.1:3000 300
+          bash test/smoke/smoke-test.sh http://127.0.0.1:3000
+
+      - name: Stop application
+        if: always()
+        run: pkill -f "node build/app" || true
+
+      - name: Upload build outputs for downstream jobs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            build
+            frontend/dist
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Check for build log artifact
+        if: always()
+        id: build_log
+        run: |
+          if [ -f build/reports/build-test-app.log ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload build/test logs
+        if: always() && steps.build_log.outputs.exists == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-test-logs
+          path: build/reports/build-test-app.log
+
+  security_checks:
+    name: security_checks
+    needs: build_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-${{ hashFiles('package.json', 'frontend/package.json', '.npmrc') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-
+
+      - name: Install dependencies
+        run: npm install --prefer-offline --no-audit --progress=false --ignore-scripts
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+
+      - name: Autobuild for CodeQL
+        uses: github/codeql-action/autobuild@v4
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Semgrep
+        run: pip install --disable-pip-version-check semgrep
+
+      - name: Determine baseline commit
+        id: baseline
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "sha=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          else
+            # For workflow_dispatch and first-push branches, gate only on changes
+            # relative to the default branch merge-base (avoid inherited demo findings).
+            default_branch="${{ github.event.repository.default_branch }}"
+            git fetch --no-tags origin "${default_branch}"
+            merge_base="$(git merge-base HEAD "origin/${default_branch}" || true)"
+            if [ -n "${merge_base}" ]; then
+              echo "sha=${merge_base}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Run Semgrep scan
+        id: semgrep_scan
+        continue-on-error: true
+        run: |
+          mkdir -p reports/semgrep
+          if [ -n "${{ steps.baseline.outputs.sha }}" ]; then
+            semgrep scan \
+              --config p/javascript \
+              --config p/nodejs \
+              --config p/secrets \
+              --exclude node_modules \
+              --exclude frontend/node_modules \
+              --exclude legacy \
+              --baseline-commit "${{ steps.baseline.outputs.sha }}" \
+              --sarif \
+              --output reports/semgrep/semgrep.sarif \
+              --error
+          else
+            semgrep scan \
+              --config p/javascript \
+              --config p/nodejs \
+              --config p/secrets \
+              --exclude node_modules \
+              --exclude frontend/node_modules \
+              --exclude legacy \
+              --sarif \
+              --output reports/semgrep/semgrep.sarif \
+              --error
+          fi
+
+      - name: Check for Semgrep SARIF output
+        if: always()
+        id: semgrep_sarif
+        run: |
+          if [ -f reports/semgrep/semgrep.sarif ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Semgrep SARIF
+        if: always() && steps.semgrep_sarif.outputs.exists == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/semgrep/semgrep.sarif
+
+      - name: Determine Gitleaks commit range
+        id: gitleaks_range
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "value=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.before }}" ] && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            echo "value=${{ github.event.before }}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            default_branch="${{ github.event.repository.default_branch }}"
+            git fetch --no-tags origin "${default_branch}"
+            merge_base="$(git merge-base HEAD "origin/${default_branch}" || true)"
+            if [ -n "${merge_base}" ]; then
+              echo "value=${merge_base}..${{ github.sha }}" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Run Gitleaks
+        id: gitleaks_scan
+        continue-on-error: true
+        run: |
+          mkdir -p reports/gitleaks
+          if [ -n "${{ steps.gitleaks_range.outputs.value }}" ]; then
+            docker run --rm \
+              -v "$PWD:/repo" \
+              ghcr.io/gitleaks/gitleaks:latest \
+              detect --source /repo \
+              --log-opts "${{ steps.gitleaks_range.outputs.value }}" \
+              --redact \
+              --report-format sarif \
+              --report-path /repo/reports/gitleaks/gitleaks.sarif \
+              --exit-code 1
+          else
+            docker run --rm \
+              -v "$PWD:/repo" \
+              ghcr.io/gitleaks/gitleaks:latest \
+              detect --source /repo \
+              --no-git \
+              --redact \
+              --report-format sarif \
+              --report-path /repo/reports/gitleaks/gitleaks.sarif \
+              --exit-code 0
+          fi
+
+      - name: Check for Gitleaks SARIF output
+        if: always()
+        id: gitleaks_sarif
+        run: |
+          if [ -f reports/gitleaks/gitleaks.sarif ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Gitleaks SARIF
+        if: always() && steps.gitleaks_sarif.outputs.exists == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: reports/gitleaks/gitleaks.sarif
+
+      - name: Run Trivy filesystem scan
+        id: trivy_fs_scan
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-fs.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          vuln-type: library
+          scanners: vuln
+          exit-code: "0"
+
+      - name: Check for Trivy filesystem SARIF output
+        if: always()
+        id: trivy_fs_sarif
+        run: |
+          if [ -f trivy-fs.sarif ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Trivy filesystem SARIF
+        if: always() && steps.trivy_fs_sarif.outputs.exists == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+
+      - name: Ensure SBOM output directory exists
+        run: mkdir -p sbom
+
+      - name: Generate CycloneDX SBOM with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom/syft-cyclonedx.json
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Record signing readiness
+        run: |
+          mkdir -p reports/signing-ready
+          cosign version > reports/signing-ready/cosign-version.txt
+          cat > reports/signing-ready/signing-example.txt <<'EOF'
+          Example keyless signing command (run in trusted CI with OIDC):
+          cosign sign --yes <image-reference-or-digest>
+          EOF
+
+      - name: Enforce security scan gates
+        if: always()
+        run: |
+          gate=0
+          if [ "${{ steps.semgrep_scan.outcome }}" = "failure" ]; then
+            echo "Semgrep reported blocking findings."
+            gate=1
+          fi
+          if [ "${{ steps.gitleaks_scan.outcome }}" = "failure" ]; then
+            echo "Gitleaks reported blocking findings."
+            gate=1
+          fi
+          if [ "${{ steps.trivy_fs_scan.outcome }}" = "failure" ]; then
+            echo "Trivy filesystem scan failed to execute."
+            gate=1
+          fi
+          exit "$gate"
+
+      - name: Upload security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-artifacts
+          path: |
+            sbom/syft-cyclonedx.json
+            reports/signing-ready
+
+  container_build_and_scan:
+    name: container_build_and_scan
+    needs: build_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.2.2
+
+      - name: Build container image
+        run: |
+          # Retry once to tolerate transient upstream registry/network failures.
+          docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} . || \
+          (echo "Retrying docker build once after transient failure..." && sleep 10 && docker build -t ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} .)
+
+      - name: Scan container image vulnerabilities
+        run: |
+          trivy image \
+            --format sarif \
+            --output trivy-image.sarif \
+            --severity HIGH,CRITICAL \
+            --ignore-unfixed \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Gate Dockerfile misconfigurations
+        run: |
+          trivy config \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            Dockerfile
+
+      - name: Gate Kubernetes base misconfigurations
+        run: |
+          trivy config \
+            --exit-code 1 \
+            --severity HIGH,CRITICAL \
+            deployment/kubernetes/base
+
+      - name: Scan local overlay misconfigurations (non-blocking)
+        run: |
+          trivy config \
+            --exit-code 0 \
+            --severity HIGH,CRITICAL \
+            deployment/kubernetes/overlays/local
+
+      - name: Check for Trivy image SARIF output
+        if: always()
+        id: trivy_image_sarif
+        run: |
+          if [ -f trivy-image.sarif ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Trivy image SARIF
+        if: always() && steps.trivy_image_sarif.outputs.exists == 'true'
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+
+      - name: Export container image for deploy
+        if: success()
+        run: |
+          mkdir -p reports/image
+          docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} | gzip -1 > reports/image/${{ env.IMAGE_NAME }}.tar.gz
+
+      - name: Upload container image artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-image
+          path: reports/image/${{ env.IMAGE_NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  dast:
+    name: dast
+    needs: build_test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Restore npm cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-${{ hashFiles('package.json', 'frontend/package.json', '.npmrc') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-npm-
+
+      - name: Download build outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: .
+
+      - name: Install dependencies
+        run: npm install --prefer-offline --no-audit --progress=false
+
+      - name: Start application
+        run: |
+          mkdir -p reports/zap build/reports
+          chmod 777 reports/zap
+          npm start > build/reports/dast-app.log 2>&1 &
+          echo $! > /tmp/juice-shop.pid
+
+      - name: Wait for healthy target
+        run: ./scripts/wait-for-http.sh http://127.0.0.1:3000 300
+
+      - name: Run OWASP ZAP baseline scan
+        run: |
+          docker run --rm \
+            --network=host \
+            -v "$PWD/reports/zap:/zap/wrk:rw" \
+            -v "$PWD/.zap/rules.tsv:/zap/rules.tsv:ro" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py \
+            -t http://127.0.0.1:3000 \
+            -a \
+            -j \
+            -m 5 \
+            -c /zap/rules.tsv \
+            -w zap-report.md \
+            -r zap-report.html \
+            -J zap-report.json
+
+      - name: Stop application
+        if: always()
+        run: |
+          if [ -f /tmp/juice-shop.pid ]; then
+            kill "$(cat /tmp/juice-shop.pid)" || true
+          fi
+          pkill -f "node build/app" || true
+
+      - name: Upload DAST artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-zap-report
+          path: |
+            reports/zap
+            build/reports/dast-app.log
+
+  deploy:
+    name: deploy
+    needs:
+      - build_test
+      - security_checks
+      - container_build_and_scan
+      - dast
+    # Protected deploy policy:
+    # - runs on master only
+    # - never runs on pull_request events
+    if: github.ref == 'refs/heads/master' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.0
+
+      - name: Download deployment image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: reports/image
+
+      - name: Load deployment image
+        run: |
+          gunzip -c reports/image/${{ env.IMAGE_NAME }}.tar.gz | docker load
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} ${{ env.IMAGE_NAME }}:kind
+
+      - name: Load image into Kind
+        run: kind load docker-image ${{ env.IMAGE_NAME }}:kind
+
+      - name: Deploy manifests
+        run: kubectl apply -k deployment/kubernetes/overlays/local
+
+      - name: Wait for rollout
+        run: kubectl -n juice-shop rollout status deployment/juice-shop --timeout=300s
+
+      - name: Smoke test deployed service
+        run: |
+          kubectl -n juice-shop port-forward service/juice-shop 3000:3000 > /tmp/port-forward.log 2>&1 &
+          ./scripts/wait-for-http.sh http://127.0.0.1:3000 180
+          bash test/smoke/smoke-test.sh http://127.0.0.1:3000
+
+      - name: Upload deployment diagnostics
+        if: always()
+        run: |
+          mkdir -p reports/k8s
+          kubectl -n juice-shop get all -o wide > reports/k8s/get-all.txt || true
+          kubectl -n juice-shop describe deployment juice-shop > reports/k8s/deployment-describe.txt || true
+          cp /tmp/port-forward.log reports/k8s/port-forward.log || true
+
+      - name: Publish deployment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-deploy-diagnostics
+          path: reports/k8s
+
+  deploy_validation:
+    name: deploy_validation
+    needs:
+      - build_test
+      - security_checks
+      - container_build_and_scan
+      - dast
+    # Manual validation path:
+    # - trigger from Actions UI using "Run workflow"
+    # - set run_deploy_validation=true
+    # - intended for non-default branches to verify deployment logic before merge
+    # - deploys only to ephemeral Kind in the GitHub runner
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_deploy_validation == 'true' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: kind
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.32.0
+
+      - name: Download deployment image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: container-image
+          path: reports/image
+
+      - name: Load deployment image
+        run: |
+          gunzip -c reports/image/${{ env.IMAGE_NAME }}.tar.gz | docker load
+          docker tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} ${{ env.IMAGE_NAME }}:kind
+
+      - name: Load image into Kind
+        run: kind load docker-image ${{ env.IMAGE_NAME }}:kind
+
+      - name: Deploy manifests
+        run: kubectl apply -k deployment/kubernetes/overlays/local
+
+      - name: Wait for rollout
+        run: kubectl -n juice-shop rollout status deployment/juice-shop --timeout=300s
+
+      - name: Smoke test deployed service
+        run: |
+          kubectl -n juice-shop port-forward service/juice-shop 3000:3000 > /tmp/port-forward.log 2>&1 &
+          ./scripts/wait-for-http.sh http://127.0.0.1:3000 180
+          bash test/smoke/smoke-test.sh http://127.0.0.1:3000
+
+      - name: Upload deployment diagnostics
+        if: always()
+        run: |
+          mkdir -p reports/k8s-validation
+          kubectl -n juice-shop get all -o wide > reports/k8s-validation/get-all.txt || true
+          kubectl -n juice-shop describe deployment juice-shop > reports/k8s-validation/deployment-describe.txt || true
+          cp /tmp/port-forward.log reports/k8s-validation/port-forward.log || true
+
+      - name: Publish deployment diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-deploy-validation-diagnostics
+          path: reports/k8s-validation

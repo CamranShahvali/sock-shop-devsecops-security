@@ -1,0 +1,13 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: juice-shop
+    newName: juice-shop
+    newTag: kind
+
+patches:
+  - path: runtime-compatibility-patch.yaml
