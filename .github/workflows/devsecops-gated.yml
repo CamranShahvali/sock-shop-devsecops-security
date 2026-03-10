@@ -37,8 +37,31 @@ env:
   IMAGE_TAG: ci-${{ github.run_id }}
 
 jobs:
+  workflow_lint:
+    name: workflow_lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go for actionlint
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: false
+
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@latest
+
+      - name: Run actionlint
+        run: |
+          ACTIONLINT_BIN="$(go env GOPATH)/bin/actionlint"
+          "$ACTIONLINT_BIN" -color
+
   build_test:
     name: build_test
+    needs: workflow_lint
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -498,7 +521,11 @@ jobs:
       - name: Wait for healthy target
         run: ./scripts/wait-for-http.sh http://127.0.0.1:3000 300
 
+      - name: Validate ZAP policy file
+        run: test -f .zap/rules.tsv
+
       - name: Run OWASP ZAP baseline scan
+        # Policy file explicitly marks expected app-specific findings (e.g. 10111 auth endpoint detection) as non-blocking.
         run: |
           docker run --rm \
             --network=host \
@@ -531,6 +558,7 @@ jobs:
           path: |
             reports/zap
             build/reports/dast-app.log
+          if-no-files-found: warn
 
   deploy:
     name: deploy
