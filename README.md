@@ -1,4 +1,4 @@
-# Senior DevSecOps/AppSec Hardening Portfolio: Sock Shop (OWASP Juice Shop Lineage)
+# DevSecOps/AppSec Hardening Portfolio: Sock Shop (OWASP Juice Shop Lineage)
 
 ## 1. Project title and executive summary
 This repository demonstrates a senior-level DevSecOps/Application Security hardening engagement on an inherited open-source application. The focus is not to claim the underlying app is “fully secure” (it is intentionally vulnerable by design), but to show how to operationalize governance, gated CI/CD, security controls, deployment policy, and remediation discipline around a complex legacy codebase. The outcome is a GitHub-native delivery model with explicit risk handling, stronger deploy controls, and reproducible security evidence.
